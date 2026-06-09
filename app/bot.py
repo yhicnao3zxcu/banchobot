@@ -1,4 +1,3 @@
-
 from discord.ext.commands import *
 from app.extensions import *
 
@@ -18,20 +17,34 @@ class BanchoBot(Bot):
         await super().close()
 
     async def load_cogs(self):
-        await self.load_extension("app.extensions.errors")
-        await self.load_extension("app.extensions.bridge")
-        await self.load_extension("app.extensions.link")
-        await self.load_extension("app.extensions.fun")
-        await self.load_extension("app.extensions.recent")
-        await self.load_extension("app.extensions.profile")
-        await self.load_extension("app.extensions.top")
-        await self.load_extension("app.extensions.simulate")
-        await self.load_extension("app.extensions.search")
-        await self.load_extension("app.extensions.rankings")
-        await self.load_extension("app.extensions.pprecord")
-        await self.load_extension("app.extensions.moderation")
-        await self.load_extension("app.extensions.beatmaps")
-        await self.tree.sync()
+        extensions = [
+            "app.extensions.errors",
+            "app.extensions.bridge",
+            "app.extensions.link",
+            "app.extensions.fun",
+            "app.extensions.recent",
+            "app.extensions.profile",
+            "app.extensions.top",
+            "app.extensions.simulate",
+            "app.extensions.search",
+            "app.extensions.rankings",
+            "app.extensions.pprecord",
+            "app.extensions.moderation",
+            "app.extensions.beatmaps",
+        ]
+        
+        for extension in extensions:
+            try:
+                await self.load_extension(extension)
+                app.session.logger.info(f'Loaded extension: {extension}')
+            except Exception as e:
+                app.session.logger.error(f'Failed to load extension {extension}: {e}')
+        
+        try:
+            await self.tree.sync()
+            app.session.logger.info('Command tree synced successfully')
+        except Exception as e:
+            app.session.logger.error(f'Failed to sync command tree: {e}')
 
 def run():
     intents = discord.Intents.default()

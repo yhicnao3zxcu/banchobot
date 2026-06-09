@@ -1,5 +1,4 @@
-
-from app.common.database.repositories import beatmapsets, beatmaps
+from app.common.database.repositories import beatmapsets, beatmaps, scores
 from app.common.database.objects import DBBeatmapset, DBBeatmap
 from app.common.config import config_instance as config
 from app.common.constants import BeatmapStatus
@@ -33,8 +32,8 @@ class BeatmapManagement(BaseCog):
         interaction: Interaction,
         beatmapset_id: int,
         round_decimal_values: bool = True,
-        fix_leadin_times: bool = False,
-        fix_perfect_curves: bool = False,
+        fix_leadin_times: bool = True,
+        fix_perfect_curves: bool = True,
         move_to_pending: bool = True
     ) -> None:
         if not self.ossapi:
@@ -64,17 +63,82 @@ class BeatmapManagement(BaseCog):
             beatmap_helper.store_ossapi_beatmapset,
             ossapi_set
         )
-
         filesize, filesize_novideo = await self.run_async(
             beatmap_helper.fetch_osz_filesizes,
             database_set.id
         )
-        
-        # Update slider multiplier values inside database
-        await self.run_async(
-            beatmap_helper.update_slider_multiplier,
-            database_set
-        )
+
+        decimal_updates = 0
+        leadin_updates = 0
+        curve_updates = 0
+
+        for beatmap in database_set.beatmaps:
+            content = await self.run_async(
+                self.storage.get_beatmap,
+                beatmap.id
+            )
+
+            if not content:
+                continue
+
+            parsed_beatmap = beatmap_helper.parse_beatmap(content, beatmap.id)
+            if parsed_beatmap is None:
+                continue
+
+            ossapi_map = next((b for b in ossapi_set.beatmaps if b.id == beatmap.id), None)
+            if ossapi_map is None:
+                continue
+
+            beatmap_updates = {
+                "slider_multiplier": parsed_beatmap.slider_multiplier,
+                "drain_length": ossapi_map.hit_length,
+                "count_normal": ossapi_map.count_circles,
+                "count_slider": ossapi_map.count_sliders,
+                "count_spinner": ossapi_map.count_spinners
+            }
+
+            if beatmap.slider_multiplier != parsed_beatmap.slider_multiplier:
+                # Slider multiplier changed from db to api
+                beatmap_updates['slider_multiplier'] = parsed_beatmap.slider_multiplier
+
+            decimals_fixed, leadin_fixed, curves_fixed = beatmap_helper.apply_beatmap_patches(
+                parsed_beatmap,
+                round_decimal_values,
+                fix_leadin_times,
+                fix_perfect_curves
+            )
+            file_updated = any(
+                [decimals_fixed, leadin_fixed, curves_fixed]
+            )
+
+            if decimals_fixed:
+                beatmap_updates['od'] = int(parsed_beatmap.overall_difficulty)
+                beatmap_updates['ar'] = int(parsed_beatmap.approach_rate)
+                beatmap_updates['hp'] = int(parsed_beatmap.hp_drain_rate)
+                beatmap_updates['cs'] = int(parsed_beatmap.circle_size)
+                decimal_updates += 1
+
+            if leadin_fixed:
+                leadin_updates += 1
+
+            if curves_fixed:
+                curve_updates += 1
+
+            if file_updated:
+                content_updated = beatmap_helper.pack_beatmap(parsed_beatmap)
+                beatmap_updates['md5'] = hashlib.md5(content_updated).hexdigest()
+
+                await self.run_async(
+                    self.storage.upload_beatmap_file,
+                    beatmap.id,
+                    content_updated
+                )
+
+            if beatmap_updates:
+                await self.update_beatmap(
+                    beatmap.id,
+                    beatmap_updates
+                )
 
         await self.update_beatmapset(
             database_set.id,
@@ -92,27 +156,16 @@ class BeatmapManagement(BaseCog):
             )
 
         followup = f"Successfully added [{database_set.full_name}](http://osu.{config.DOMAIN_NAME}/s/{database_set.id}) to Titanic!"
+        total_beatmaps = len(database_set.beatmaps) - 1  # why -1, i don't understand
 
         if round_decimal_values:
-            updates = await self.run_async(
-                beatmap_helper.fix_beatmap_decimal_values,
-                database_set
-            )
-            followup += f"\n(Fixed {len(updates)}/{len(database_set.beatmaps)} beatmaps with decimal values)"
+            followup += f"\n(Fixed {decimal_updates}/{total_beatmaps} beatmaps with decimal values)"
 
         if fix_leadin_times:
-            updates = await self.run_async(
-                beatmap_helper.fix_beatmap_lead_in,
-                database_set
-            )
-            followup += f"\n(Fixed lead-in times for {len(updates)}/{len(database_set.beatmaps)} beatmaps)"
+            followup += f"\n(Fixed lead-in times for {leadin_updates}/{total_beatmaps} beatmaps)"
 
         if fix_perfect_curves:
-            updates = await self.run_async(
-                self.fix_beatmapset_perfect_curves,
-                database_set
-            )
-            followup += f"\n(Fixed perfect curves for {len(updates)}/{len(database_set.beatmaps)} beatmaps)"
+            followup += f"\n(Fixed perfect curves for {curve_updates}/{total_beatmaps} beatmaps)"
 
         # TODO: Discord webhook updates
         return await interaction.followup.send(followup)
@@ -137,6 +190,18 @@ class BeatmapManagement(BaseCog):
                 f"Beatmapset `{beatmapset.full_name}` was approved and cannot be deleted!",
                 ephemeral=True
             )
+
+        for beatmap in beatmapset.beatmaps:
+            existing_top_scores = scores.fetch_count_beatmap(
+                beatmap.id,
+                beatmap.mode
+            )
+
+            if existing_top_scores > 0:
+                return await interaction.response.send_message(
+                    f"Beatmapset `{beatmapset.full_name}` has scores and cannot be deleted.\n"
+                    f"Please yell at Levi if you want them gone!"
+                )
 
         await interaction.response.defer()
         await self.run_async(
@@ -168,11 +233,22 @@ class BeatmapManagement(BaseCog):
                 f"Beatmap `{beatmap.full_name}` was approved and cannot be deleted!",
                 ephemeral=True
             )
-            
+
         if len(beatmap.beatmapset.beatmaps) <= 1:
             return await interaction.response.send_message(
                 f"Beatmap `{beatmap.full_name}` is the only map in its set, please use `/deleteset {beatmap.set_id}` instead!",
                 ephemeral=True
+            )
+
+        existing_top_scores = scores.fetch_count_beatmap(
+            beatmap.id,
+            beatmap.mode
+        )
+
+        if existing_top_scores > 0:
+            return await interaction.response.send_message(
+                f"Beatmap `{beatmap.full_name}` has scores and cannot be deleted.\n"
+                f"Please yell at Levi if you want it gone!"
             )
 
         await interaction.response.defer()
@@ -184,7 +260,7 @@ class BeatmapManagement(BaseCog):
         return await interaction.followup.send(
             f"Successfully deleted beatmap `{beatmap.full_name}`!"
         )
-        
+
     @app_commands.command(name="modset", description="Modify a beatmapset's status")
     @app_commands.check(role_check)
     async def modify_beatmapset_command(
@@ -211,7 +287,7 @@ class BeatmapManagement(BaseCog):
             beatmapset.id,
             {'status': status.value}
         )
-        
+
         if status >= BeatmapStatus.Ranked:
             await self.update_beatmapset(
                 beatmapset.id,
@@ -222,7 +298,7 @@ class BeatmapManagement(BaseCog):
         return await interaction.followup.send(
             f"Successfully updated the status of [{beatmapset.full_name}](http://osu.{config.DOMAIN_NAME}/s/{beatmapset.id}) to `{status.name}`!"
         )
-        
+
     @app_commands.command(name="moddiff", description="Modify a single beatmap's status")
     @app_commands.check(role_check)
     async def modify_beatmap_command(
@@ -256,7 +332,7 @@ class BeatmapManagement(BaseCog):
     async def upload_beatmap_command(
         self,
         interaction: Interaction,
-        file: Attachment,
+        attachment: Attachment,
         beatmap_id: int
     ) -> None:
         beatmap = await self.fetch_beatmap(beatmap_id)
@@ -268,19 +344,99 @@ class BeatmapManagement(BaseCog):
             )
 
         await interaction.response.defer()
-        file = await file.read()
+        content = await attachment.read()
 
         await self.run_async(
             self.storage.upload_beatmap_file,
-            beatmap.id, file
+            beatmap.id, content
         )
         await self.update_beatmap(
             beatmap.id,
-            {'md5': hashlib.md5(file).hexdigest()}
+            {'md5': hashlib.md5(content).hexdigest()}
         )
 
         return await interaction.followup.send(
             f"Successfully replaced the .osu file for [{beatmap.full_name}](http://osu.{config.DOMAIN_NAME}/b/{beatmap.id})!"
+        )
+
+    @app_commands.command(name="fixmap", description="Fix common compatibility issues in a beatmap file")
+    @app_commands.check(role_check)
+    async def fix_beatmap_command(
+        self,
+        interaction: Interaction,
+        beatmap_id: int,
+        fix_decimal_values: bool = True,
+        fix_leadin_times: bool = True,
+        fix_perfect_curves: bool = True
+    ) -> None:
+        beatmap = await self.fetch_beatmap(beatmap_id)
+
+        if not beatmap:
+            return await interaction.response.send_message(
+                f"Beatmap `{beatmap_id}` does not exist on Titanic!",
+                ephemeral=True
+            )
+
+        content = await self.run_async(
+            self.storage.get_beatmap,
+            beatmap.id
+        )
+
+        if not content:
+            return await interaction.response.send_message(
+                f".osu file for [{beatmap.full_name}]({beatmap.link}) not found in storage!",
+                ephemeral=True
+            )
+
+        parsed_beatmap = beatmap_helper.parse_beatmap(
+            content,
+            beatmap.id
+        )
+        if parsed_beatmap is None:
+            return await interaction.response.send_message(
+                f"Failed to parse the .osu file for [{beatmap.full_name}]({beatmap.link})!",
+                ephemeral=True
+            )
+
+        await interaction.response.defer()
+
+        decimals_fixed, leadin_fixed, curves_fixed = beatmap_helper.apply_beatmap_patches(
+            parsed_beatmap,
+            fix_decimal_values,
+            fix_leadin_times,
+            fix_perfect_curves
+        )
+        file_updated = any(
+            [decimals_fixed, leadin_fixed, curves_fixed]
+        )
+
+        if not file_updated:
+            return await interaction.followup.send(
+                f"No issues found in the .osu file for [{beatmap.full_name}](http://osu.{config.DOMAIN_NAME}/b/{beatmap.id})!",
+                ephemeral=True
+            )
+
+        updates: dict[str, int | str] = {
+            'od': int(parsed_beatmap.overall_difficulty),
+            'ar': int(parsed_beatmap.approach_rate),
+            'hp': int(parsed_beatmap.hp_drain_rate),
+            'cs': int(parsed_beatmap.circle_size)
+        }
+
+        content_updated = beatmap_helper.pack_beatmap(parsed_beatmap)
+        updates['md5'] = hashlib.md5(content_updated).hexdigest()
+
+        await self.run_async(
+            self.storage.upload_beatmap_file,
+            beatmap.id, content_updated
+        )
+        await self.update_beatmap(
+            beatmap.id,
+            updates
+        )
+
+        return await interaction.followup.send(
+            f"Successfully fixed the .osu file for [{beatmap.full_name}](http://osu.{config.DOMAIN_NAME}/b/{beatmap.id})!"
         )
 
     @app_commands.command(name="downloadset", description="Move the files of a beatmapset from Bancho to Titanic")
@@ -295,7 +451,7 @@ class BeatmapManagement(BaseCog):
                 f"Beatmapset `{beatmapset_id}` does not exist on Titanic!",
                 ephemeral=True
             )
-            
+
         if beatmapset.server != 0 or beatmapset.download_server != 0:
             return await interaction.response.send_message(
                 f"Beatmapset `{beatmapset.full_name}` is already hosted on Titanic!",
@@ -440,29 +596,6 @@ class BeatmapManagement(BaseCog):
             f"Download it [here](http://osu.{config.DOMAIN_NAME}/d/{beatmapset.id}). "
             f"({len(beatmapset.beatmaps)} beatmaps updated)"
         )
-
-    def fix_beatmapset_perfect_curves(self, beatmapset: DBBeatmapset) -> List[int]:
-        updated_maps = []
-
-        for beatmap in beatmapset.beatmaps:
-            content = self.storage.get_beatmap(beatmap.id)
-            if not content:
-                continue
-
-            try:
-                content_decoded = content.decode('utf-8-sig')
-                content_updated = beatmap_helper.process_perfect_curves(content_decoded)
-            except Exception as error:
-                self.logger.error(f"Failed to process perfect curves for map {beatmap.id}: {error}")
-                continue
-
-            if content_updated is None:
-                continue
-
-            self.storage.upload_beatmap_file(beatmap.id, content_updated.encode('utf-8'))
-            updated_maps.append(beatmap.id)
-
-        return updated_maps
 
     async def fetch_beatmapset(self, beatmapset_id: int) -> DBBeatmapset | None:
         with self.database.managed_session() as session:

@@ -1,8 +1,7 @@
-
 from ossapi.ossapiv2_async import OssapiAsync
-from discord.ext.commands import Cog
+from discord.ext.commands import Cog, Context
 from discord import Interaction
-from typing import Callable
+from typing import Callable, Any
 
 from app.common.database.objects import DBUser, DBBeatmapset
 from app.common.config import config_instance as config
@@ -12,6 +11,7 @@ from app import session
 
 import hashlib
 import asyncio
+import logging
 
 class BaseCog(Cog):
     def __init__(self) -> None:
@@ -29,10 +29,16 @@ class BaseCog(Cog):
         if not config.OSU_CLIENT_ID or not config.OSU_CLIENT_SECRET:
             return
 
-        self.ossapi = OssapiAsync(
-            config.OSU_CLIENT_ID,
-            config.OSU_CLIENT_SECRET
-        )
+        if not config.OSU_CLIENT_ID.isdigit():
+            return
+
+        try:
+            self.ossapi = OssapiAsync(
+                int(config.OSU_CLIENT_ID),
+                config.OSU_CLIENT_SECRET
+            )
+        except Exception as e:
+            self.logger.warning(f'Failed to initialize OSU API client: {e}')
 
     @staticmethod
     async def run_async(func: Callable, *args, **kwargs):
@@ -51,6 +57,32 @@ class BaseCog(Cog):
         url = f"http://osu.{config.DOMAIN_NAME}/mt/{beatmapset.id}"
         url += f"?c={update_hash}"
         return url
+
+    async def cog_before_invoke(self, ctx: Context) -> None:
+        if ctx.command is None:
+            return
+
+        options = {
+            key: value
+            for key, value in ctx.kwargs.items()
+            if key not in {"self", "ctx"}
+        }
+        self.logger.info(
+            f"@{ctx.author.name} -> /{ctx.command.qualified_name} {options}"
+        )
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if interaction.command is None:
+            return True
+
+        options = (
+            interaction.namespace.__dict__
+            if interaction.namespace else {}
+        )
+        self.logger.info(
+            f"@{interaction.user.name} -> /{interaction.command.qualified_name} {options}"
+        )
+        return True
 
     async def resolve_user(self, discord_id: int) -> DBUser | None:
         return await self.run_async(
@@ -75,7 +107,7 @@ class BaseCog(Cog):
             users.fetch_by_name_case_insensitive,
             username
         )
-        
+
     async def resolve_user_by_safe_name(self, username: str) -> DBUser | None:
         return await self.run_async(
             users.fetch_by_safe_name,
