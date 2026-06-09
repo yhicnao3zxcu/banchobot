@@ -32,13 +32,10 @@ class BaseCog(Cog):
         if not config.OSU_CLIENT_ID.isdigit():
             return
 
-        try:
-            self.ossapi = OssapiAsync(
-                int(config.OSU_CLIENT_ID),
-                config.OSU_CLIENT_SECRET
-            )
-        except Exception as e:
-            self.logger.warning(f'Failed to initialize OSU API client: {e}')
+        self.ossapi = OssapiAsync(
+            int(config.OSU_CLIENT_ID),
+            config.OSU_CLIENT_SECRET
+        )
 
     @staticmethod
     async def run_async(func: Callable, *args, **kwargs):

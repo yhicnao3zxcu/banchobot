@@ -6,7 +6,6 @@ from app.common.constants import Mods, GameMode
 from app.common.helpers import performance
 from app.cog import BaseCog
 
-from rosu_pp_py import DifficultyAttributes
 from discord.ext.commands import Bot
 from discord.ext import commands
 from discord import Color, Embed
@@ -14,7 +13,7 @@ from typing import List
 
 class RecentScore(BaseCog):
     @commands.hybrid_command("recent", description="Display the last score of another player or yourself", aliases=["r", "rs", "last"])
-    async def recent_score(self, ctx: commands.Context, username: str | None = None) -> None:
+    async def recent_score(self, ctx: commands.Context, username: str | None = None):
         user = (
             await self.resolve_user(ctx.author.id) if username is None else
             await self.resolve_user_from_identifier(username)
@@ -48,12 +47,12 @@ class RecentScore(BaseCog):
         beatmap_file: bytes,
         mode: int,
         mods: Mods = Mods.NoMod
-    ) -> DifficultyAttributes | None:
+    ) -> performance.ppv2.DifficultyAttributes | None:
         return await self.run_async(
             performance.calculate_difficulty,
             beatmap_file, mode, mods
         )
-        
+
     async def calculate_fc_pp(
         self,
         score: DBScore
@@ -89,7 +88,7 @@ class RecentScore(BaseCog):
         mode_text = mode.formatted
         mods_text = mods.short
         stars_text = (
-            f"{beatmap_difficulty.stars:.2f}★"
+            f"{beatmap_difficulty.star_rating:.2f}★"
             if beatmap_difficulty else "N/A"
         )
 
